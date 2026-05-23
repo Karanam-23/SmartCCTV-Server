@@ -53,65 +53,96 @@ io.on('connection', (socket) => {
   // JOIN ROOM
   // ===============================
 
-  socket.on('join-room', ({ roomCode, role }) => {
-    if (!roomCode || !role) {
-      console.log('[ERROR] Invalid join-room payload');
-      return;
-    }
+socket.on('join-room', ({ roomCode, role }) => {
+  if (!roomCode || !role) {
+    console.log('[ERROR] Invalid join-room payload');
+    return;
+  }
 
-    const code = roomCode.toUpperCase().trim();
+  const code = roomCode.toUpperCase().trim();
 
-    if (!rooms[code]) {
-      rooms[code] = {
-        cameraSocketId: null,
-        viewerSocketId: null,
-        viewerFcmToken: null,
-        createdAt: Date.now()
-      };
-    }
+  // Create room if not exists
+  if (!rooms[code]) {
+    rooms[code] = {
+      cameraSocketId: null,
+      viewerSocketId: null,
+      viewerFcmToken: null,
+      createdAt: Date.now()
+    };
+  }
 
-    // Leave any previous room
-    if (socket.currentRoom && socket.currentRoom !== code) {
-      socket.leave(socket.currentRoom);
-    }
-
-    socket.join(code);
-    socket.currentRoom = code;
-    socket.currentRole = role;
-
-    console.log(`[JOIN] ${role} joined room: ${code} (socket: ${socket.id})`);
-    console.log(`[ROOM] ${code} state: camera=${rooms[code].cameraSocketId} viewer=${rooms[code].viewerSocketId}`);
-
-    if (role === 'camera') {
-      rooms[code].cameraSocketId = socket.id;
-
-      // If viewer already waiting — tell camera to create offer
-      if (rooms[code].viewerSocketId) {
-        console.log(`[WEBRTC] Viewer already in room ${code} — telling camera to create offer`);
-        socket.emit('create-offer', { roomCode: code });
-      }
-
-      // Tell viewer camera is ready
-      socket.to(code).emit('camera-connected', { roomCode: code });
-    }
-
-    if (role === 'viewer') {
-      rooms[code].viewerSocketId = socket.id;
-
-      if (rooms[code].cameraSocketId) {
-        console.log(`[WEBRTC] Camera already in room ${code} — telling camera to create offer`);
-        // Tell CAMERA to create offer now that viewer is ready
-        io.to(rooms[code].cameraSocketId).emit('create-offer', { roomCode: code });
-        // Tell viewer camera is available
-        socket.emit('camera-connected', { roomCode: code });
-      } else {
-        console.log(`[WEBRTC] Camera not in room ${code} yet — viewer waiting`);
-        socket.emit('waiting-for-camera', { roomCode: code });
+  // Leave any previous room this socket was in
+  if (socket.currentRoom && socket.currentRoom !== code) {
+    socket.leave(socket.currentRoom);
+    const oldRoom = rooms[socket.currentRoom];
+    if (oldRoom) {
+      if (socket.currentRole === 'camera') {
+        oldRoom.cameraSocketId = null;
+      } else if (socket.currentRole === 'viewer') {
+        oldRoom.viewerSocketId = null;
+        oldRoom.viewerFcmToken = null;
       }
     }
+  }
 
-    console.log(`[ROOMS] Active:`, Object.keys(rooms));
-  });
+  socket.join(code);
+  socket.currentRoom = code;
+  socket.currentRole = role;
+
+  console.log(`[JOIN] ${role} joined room: ${code} | socket: ${socket.id}`);
+
+  if (role === 'camera') {
+
+    // If a different camera was already here, evict it
+    if (rooms[code].cameraSocketId &&
+        rooms[code].cameraSocketId !== socket.id) {
+      console.log(`[JOIN] Evicting old camera from ${code}`);
+      io.to(rooms[code].cameraSocketId)
+        .emit('session-ended', { reason: 'replaced' });
+    }
+
+    rooms[code].cameraSocketId = socket.id;
+
+    // If viewer already waiting, tell camera to create offer
+    if (rooms[code].viewerSocketId) {
+      console.log(`[WEBRTC] Viewer waiting in ${code} — sending create-offer to camera`);
+      socket.emit('create-offer', { roomCode: code });
+    }
+
+    socket.to(code).emit('camera-connected', { roomCode: code });
+  }
+
+  if (role === 'viewer') {
+
+    // If a different viewer was already here, evict it
+    if (rooms[code].viewerSocketId &&
+        rooms[code].viewerSocketId !== socket.id) {
+      console.log(`[JOIN] Evicting old viewer from ${code}`);
+      io.to(rooms[code].viewerSocketId)
+        .emit('session-ended', { reason: 'replaced' });
+      rooms[code].viewerFcmToken = null;
+    }
+
+    rooms[code].viewerSocketId = socket.id;
+
+    if (rooms[code].cameraSocketId) {
+      console.log(`[WEBRTC] Camera in ${code} — sending create-offer to camera`);
+      // Tell camera to create a fresh offer
+      io.to(rooms[code].cameraSocketId)
+        .emit('create-offer', { roomCode: code });
+      socket.emit('camera-connected', { roomCode: code });
+    } else {
+      console.log(`[WEBRTC] No camera in ${code} — viewer waiting`);
+      socket.emit('waiting-for-camera', { roomCode: code });
+    }
+  }
+
+  console.log(`[ROOMS]`, Object.keys(rooms).map(k => ({
+    code: k,
+    cam: !!rooms[k].cameraSocketId,
+    viewer: !!rooms[k].viewerSocketId
+  })));
+});
 
   // ===============================
   // WEBRTC SIGNALING
@@ -279,30 +310,40 @@ io.on('connection', (socket) => {
   // DISCONNECT
   // ===============================
 
-  socket.on('disconnect', () => {
-    const code = socket.currentRoom;
-    const role = socket.currentRole;
+ socket.on('disconnect', () => {
+  const code = socket.currentRoom;
+  const role = socket.currentRole;
 
-    console.log(`[DISCONNECT] ${socket.id} (${role} in ${code})`);
+  console.log(`[DISCONNECT] ${socket.id} (${role} in ${code})`);
 
-    if (code && rooms[code]) {
-      if (role === 'camera') {
+  if (code && rooms[code]) {
+    if (role === 'camera') {
+      if (rooms[code].cameraSocketId === socket.id) {
         rooms[code].cameraSocketId = null;
-        socket.to(code).emit('camera-disconnected');
-      } else if (role === 'viewer') {
+        // Notify viewer camera is gone
+        io.to(code).emit('camera-disconnected');
+        console.log(`[DISCONNECT] Camera left ${code}`);
+      }
+    } else if (role === 'viewer') {
+      if (rooms[code].viewerSocketId === socket.id) {
         rooms[code].viewerSocketId = null;
         rooms[code].viewerFcmToken = null;
-        socket.to(code).emit('viewer-disconnected');
-      }
-
-      if (!rooms[code].cameraSocketId && !rooms[code].viewerSocketId) {
-        delete rooms[code];
-        console.log(`[ROOM] Deleted empty room: ${code}`);
+        // Notify camera viewer is gone
+        io.to(code).emit('viewer-disconnected');
+        console.log(`[DISCONNECT] Viewer left ${code}`);
       }
     }
 
-    console.log('[ROOMS] Active:', Object.keys(rooms));
-  });
+    // Clean up empty rooms
+    if (!rooms[code].cameraSocketId &&
+        !rooms[code].viewerSocketId) {
+      delete rooms[code];
+      console.log(`[ROOM] Deleted empty room: ${code}`);
+    }
+  }
+
+  console.log(`[ROOMS] Active:`, Object.keys(rooms));
+});
 });
 
 const PORT = process.env.PORT || 3000;
